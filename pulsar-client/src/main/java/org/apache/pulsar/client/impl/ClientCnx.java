@@ -84,7 +84,6 @@ import org.apache.pulsar.common.api.proto.PulsarApi.CommandReachedEndOfTopic;
 import org.apache.pulsar.common.api.proto.PulsarApi.CommandSendError;
 import org.apache.pulsar.common.api.proto.PulsarApi.CommandSendReceipt;
 import org.apache.pulsar.common.api.proto.PulsarApi.CommandSuccess;
-import org.apache.pulsar.common.api.proto.PulsarApi.MessageIdData;
 import org.apache.pulsar.common.api.proto.PulsarApi.ServerError;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
@@ -208,9 +207,20 @@ public class ClientCnx extends PulsarHandler {
         } else {
             log.info("{} Connected through proxy to target broker at {}", ctx.channel(), proxyToTargetBrokerAddress);
         }
-        // Send CONNECT command
-        ctx.writeAndFlush(newConnectCommand())
-                .addListener(future -> {
+
+        CompletableFuture<ByteBuf> connectFuture = newConnectCommand();
+        if (!connectFuture.isDone()) {
+            eventLoopGroup.schedule(() -> {
+                if (!connectFuture.isDone()) {
+                    connectFuture.completeExceptionally(new TimeoutException("New connect command timeout after ms " + operationTimeoutMs));
+                }
+            }, operationTimeoutMs, TimeUnit.MILLISECONDS);
+        }
+
+        connectFuture.whenComplete((data, th) -> {
+            if (th == null) {
+                // Send CONNECT command
+                ctx.writeAndFlush(data).addListener(future -> {
                     if (future.isSuccess()) {
                         if (log.isDebugEnabled()) {
                             log.debug("Complete: {}", future.isSuccess());
@@ -221,16 +231,21 @@ public class ClientCnx extends PulsarHandler {
                         ctx.close();
                     }
                 });
+            } else {
+                log.warn("Error during handshake", th);
+                ctx.close();
+            }
+        });
     }
 
-    protected ByteBuf newConnectCommand() throws Exception {
+    protected CompletableFuture<ByteBuf> newConnectCommand() throws Exception {
         // mutual authentication is to auth between `remoteHostName` and this client for this channel.
         // each channel will have a mutual client/server pair, mutual client evaluateChallenge with init data,
         // and return authData to server.
         authenticationDataProvider = authentication.getAuthData(remoteHostName);
         AuthData authData = authenticationDataProvider.authenticate(AuthData.INIT_AUTH_DATA);
-        return Commands.newConnect(authentication.getAuthMethodName(), authData, this.protocolVersion,
-                PulsarVersion.getVersion(), proxyToTargetBrokerAddress, null, null, null);
+        return CompletableFuture.completedFuture(Commands.newConnect(authentication.getAuthMethodName(), authData, this.protocolVersion,
+                PulsarVersion.getVersion(), proxyToTargetBrokerAddress, null, null, null));
     }
 
     @Override
