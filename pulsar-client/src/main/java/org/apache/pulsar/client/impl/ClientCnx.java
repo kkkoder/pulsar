@@ -18,11 +18,6 @@
  */
 package org.apache.pulsar.client.impl;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkState;
-import static org.apache.pulsar.client.impl.TransactionMetaStoreHandler.getExceptionByServerError;
-import static org.apache.pulsar.common.util.Runnables.catchingAndLoggingThrowables;
-
 import com.google.common.collect.Queues;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -33,22 +28,6 @@ import io.netty.channel.unix.Errors.NativeIoException;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.Promise;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.nio.channels.ClosedChannelException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
-import java.util.Queue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import javax.net.ssl.SSLSession;
 import lombok.Getter;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.commons.lang3.tuple.Pair;
@@ -62,8 +41,7 @@ import org.apache.pulsar.client.api.transaction.TransactionCoordinatorClientExce
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.client.impl.BinaryProtoLookupService.LookupDataResult;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
-import org.apache.pulsar.common.api.proto.CommandTcClientConnectResponse;
-import org.apache.pulsar.common.tls.TlsHostnameVerifier;
+import org.apache.pulsar.client.impl.schema.SchemaInfoUtil;
 import org.apache.pulsar.client.impl.transaction.TransactionBufferHandler;
 import org.apache.pulsar.client.util.TimedCompletableFuture;
 import org.apache.pulsar.common.api.AuthData;
@@ -92,16 +70,39 @@ import org.apache.pulsar.common.api.proto.CommandReachedEndOfTopic;
 import org.apache.pulsar.common.api.proto.CommandSendError;
 import org.apache.pulsar.common.api.proto.CommandSendReceipt;
 import org.apache.pulsar.common.api.proto.CommandSuccess;
+import org.apache.pulsar.common.api.proto.CommandTcClientConnectResponse;
 import org.apache.pulsar.common.api.proto.ServerError;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.PulsarHandler;
-import org.apache.pulsar.client.impl.schema.SchemaInfoUtil;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
+import org.apache.pulsar.common.tls.TlsHostnameVerifier;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.collections.ConcurrentLongHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.net.ssl.SSLSession;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.channels.ClosedChannelException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
+import static org.apache.pulsar.client.impl.TransactionMetaStoreHandler.getExceptionByServerError;
+import static org.apache.pulsar.common.util.Runnables.catchingAndLoggingThrowables;
 
 @SuppressWarnings("unchecked")
 public class ClientCnx extends PulsarHandler {
@@ -230,8 +231,20 @@ public class ClientCnx extends PulsarHandler {
             log.info("{} Connected through proxy to target broker at {}", ctx.channel(), proxyToTargetBrokerAddress);
         }
         // Send CONNECT command
-        ctx.writeAndFlush(newConnectCommand())
-                .addListener(future -> {
+
+        CompletableFuture<ByteBuf> connectFuture = newConnectCommand();
+        if (!connectFuture.isDone()) {
+            eventLoopGroup.schedule(() -> {
+                if (!connectFuture.isDone()) {
+                    connectFuture.completeExceptionally(new TimeoutException("New connect command timeout after ms " + operationTimeoutMs));
+                }
+            }, operationTimeoutMs, TimeUnit.MILLISECONDS);
+        }
+
+        connectFuture.whenComplete((data, th) -> {
+            if (th == null) {
+                // Send CONNECT command
+                ctx.writeAndFlush(data).addListener(future -> {
                     if (future.isSuccess()) {
                         if (log.isDebugEnabled()) {
                             log.debug("Complete: {}", future.isSuccess());
@@ -242,16 +255,23 @@ public class ClientCnx extends PulsarHandler {
                         ctx.close();
                     }
                 });
+            } else {
+                log.warn("Error during handshake", th);
+                ctx.close();
+            }
+        });
     }
 
-    protected ByteBuf newConnectCommand() throws Exception {
+    protected CompletableFuture<ByteBuf> newConnectCommand() throws Exception {
         // mutual authentication is to auth between `remoteHostName` and this client for this channel.
         // each channel will have a mutual client/server pair, mutual client evaluateChallenge with init data,
         // and return authData to server.
         authenticationDataProvider = authentication.getAuthData(remoteHostName);
         AuthData authData = authenticationDataProvider.authenticate(AuthData.INIT_AUTH_DATA);
-        return Commands.newConnect(authentication.getAuthMethodName(), authData, this.protocolVersion,
-                PulsarVersion.getVersion(), proxyToTargetBrokerAddress, null, null, null);
+        return CompletableFuture.completedFuture(
+            Commands.newConnect(authentication.getAuthMethodName(), authData, this.protocolVersion,
+                PulsarVersion.getVersion(), proxyToTargetBrokerAddress, null, null, null)
+        );
     }
 
     @Override

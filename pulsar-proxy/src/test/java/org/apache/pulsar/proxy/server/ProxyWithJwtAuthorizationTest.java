@@ -18,13 +18,7 @@
  */
 package org.apache.pulsar.proxy.server;
 
-import static org.mockito.Mockito.spy;
-
 import com.google.common.collect.Sets;
-
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
 import org.apache.pulsar.broker.authentication.AuthenticationProviderToken;
@@ -48,6 +42,20 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import javax.crypto.SecretKey;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 public class ProxyWithJwtAuthorizationTest extends ProducerConsumerBase {
     private static final Logger log = LoggerFactory.getLogger(ProxyWithAuthorizationTest.class);
@@ -73,6 +81,8 @@ public class ProxyWithJwtAuthorizationTest extends ProducerConsumerBase {
         conf.setAuthenticationEnabled(true);
         conf.setAuthorizationEnabled(true);
         conf.getProperties().setProperty("tokenSecretKey", "data:;base64," + Base64.getEncoder().encodeToString(SECRET_KEY.getEncoded()));
+        conf.setAuthenticationRefreshCheckSeconds(1);
+        conf.setAuthenticateOriginalAuthData(true);
 
         Set<String> superUserRoles = new HashSet<>();
         superUserRoles.add(ADMIN_ROLE);
@@ -94,6 +104,7 @@ public class ProxyWithJwtAuthorizationTest extends ProducerConsumerBase {
         // start proxy service
         proxyConfig.setAuthenticationEnabled(true);
         proxyConfig.setAuthorizationEnabled(false);
+        proxyConfig.setForwardAuthorizationCredentials(true);
         proxyConfig.getProperties().setProperty("tokenSecretKey", "data:;base64," + Base64.getEncoder().encodeToString(SECRET_KEY.getEncoded()));
         proxyConfig.setBrokerServiceURL(pulsar.getBrokerServiceUrl());
 
@@ -362,6 +373,72 @@ public class ProxyWithJwtAuthorizationTest extends ProducerConsumerBase {
         consumer.acknowledgeCumulative(msg);
         consumer.close();
         log.info("-- Exiting {} test --", methodName);
+    }
+
+    @Test
+    void testRefreshClientToken() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        startProxy();
+        createAdminClient();
+
+        @SuppressWarnings("unchecked")
+        Supplier<String> tokenSupplier = Mockito.mock(Supplier.class);
+        when(tokenSupplier.get()).thenAnswer(answer -> createClientJwtToken(Duration.ofSeconds(1)));
+
+        PulsarClient proxyClient = PulsarClient.builder()
+                .serviceUrl(proxyService.getServiceUrl()).statsInterval(0, TimeUnit.SECONDS)
+                .authentication(AuthenticationFactory.token(tokenSupplier))
+                .operationTimeout(1000, TimeUnit.MILLISECONDS)
+                .build();
+
+        String namespaceName = "my-property/proxy-authorization/my-ns";
+        admin.clusters().createCluster("proxy-authorization", ClusterData.builder().serviceUrl(brokerUrl.toString()).build());
+        admin.tenants().createTenant("my-property",
+                new TenantInfoImpl(Sets.newHashSet("appid1", "appid2"), Sets.newHashSet("proxy-authorization")));
+        admin.namespaces().createNamespace(namespaceName);
+
+        admin.namespaces().grantPermissionOnNamespace(namespaceName, CLIENT_ROLE,
+                Sets.newHashSet(AuthAction.consume, AuthAction.produce));
+        log.info("-- Admin permissions {} ---", admin.namespaces().getPermissions(namespaceName));
+
+        Producer<byte[]> producer = proxyClient.newProducer(Schema.BYTES)
+                .topic("persistent://my-property/proxy-authorization/my-ns/my-topic1").create();
+
+        final int msgs = 10;
+        for (int i = 0; i < msgs; i++) {
+            String message = "my-message-" + i;
+            producer.send(message.getBytes());
+        }
+
+        //noinspection unchecked
+        clearInvocations(tokenSupplier);
+        Thread.sleep(3000);
+        verify(tokenSupplier, atLeastOnce()).get();
+
+        Consumer<byte[]> consumer = proxyClient.newConsumer()
+                .topic("persistent://my-property/proxy-authorization/my-ns/my-topic1")
+                .subscriptionName("my-subscriber-name")
+                .subscriptionInitialPosition(SubscriptionInitialPosition.Earliest)
+                .subscribe();
+
+        Message<byte[]> msg;
+        Set<String> messageSet = new HashSet<>();
+        for (int i = 0; i < 10; i++) {
+            msg = consumer.receive(5, TimeUnit.SECONDS);
+            String receivedMessage = new String(msg.getData());
+            log.debug("Received message: [{}]", receivedMessage);
+            String expectedMessage = "my-message-" + i;
+            testMessageOrderAndDuplicates(messageSet, receivedMessage, expectedMessage);
+        }
+    }
+
+    private String createClientJwtToken(Duration duration) {
+        Date expiration = new Date(System.currentTimeMillis() + duration.toMillis());
+        return Jwts.builder()
+                .setSubject(CLIENT_ROLE)
+                .setExpiration(expiration)
+                .signWith(SECRET_KEY).compact();
     }
 
     private void createAdminClient() throws Exception {

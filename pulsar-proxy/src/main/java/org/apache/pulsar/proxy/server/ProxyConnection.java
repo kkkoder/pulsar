@@ -21,8 +21,12 @@ package org.apache.pulsar.proxy.server;
 import static com.google.common.base.Preconditions.checkArgument;
 
 import java.net.SocketAddress;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import javax.naming.AuthenticationException;
 import javax.net.ssl.SSLSession;
@@ -90,6 +94,8 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
     private int protocolVersionToAdvertise;
     private String proxyToBrokerUrl;
     private HAProxyMessage haProxyMessage;
+    private final AtomicReference<List<CompletableFuture<AuthData>>> authFutureList =
+        new AtomicReference<>(Collections.emptyList());
 
     private static final byte[] EMPTY_CREDENTIALS = new byte[0];
 
@@ -259,11 +265,16 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
         // authentication has completed, will send newConnected command.
         if (authState.isComplete()) {
             clientAuthRole = authState.getAuthRole();
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("[{}] Client successfully authenticated with {} role {}",
-                    remoteAddress, authMethod, clientAuthRole);
+            if (state == State.Init || state == State.Connecting) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("[{}] Client successfully authenticated with {} role {}",
+                        remoteAddress, authMethod, clientAuthRole);
+                }
+                createClientAndCompleteConnect(clientData);
+            } else {
+                updateClientAuthData(clientData);
+                LOG.debug("[{}] Refreshed authentication credentials for role {}", remoteAddress, clientAuthRole);
             }
-            createClientAndCompleteConnect(clientData);
             return;
         }
 
@@ -274,7 +285,6 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
                 remoteAddress, authMethod);
         }
         state = State.Connecting;
-        return;
     }
 
     @Override
@@ -360,7 +370,7 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
 
     @Override
     protected void handleAuthResponse(CommandAuthResponse authResponse) {
-        checkArgument(state == State.Connecting);
+        checkArgument(state == State.Connecting || state == State.ProxyLookupRequests);
         checkArgument(authResponse.hasResponse());
         checkArgument(authResponse.getResponse().hasAuthData() && authResponse.getResponse().hasAuthMethodName());
 
@@ -393,6 +403,7 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
 
         lookupProxyHandler.handleGetTopicsOfNamespace(commandGetTopicsOfNamespace);
     }
+
     @Override
     protected void handleGetSchema(CommandGetSchema commandGetSchema) {
         checkArgument(state == State.ProxyLookupRequests);
@@ -444,9 +455,63 @@ public class ProxyConnection extends PulsarHandler implements FutureListener<Voi
     private PulsarClientImpl createClient(final ClientConfigurationData clientConf, final AuthData clientAuthData,
             final String clientAuthMethod, final int protocolVersion) throws PulsarClientException {
         this.connectionPool = new ProxyConnectionPool(clientConf, service.getWorkerGroup(),
-                () -> new ProxyClientCnx(clientConf, service.getWorkerGroup(), clientAuthRole, clientAuthData,
-                        clientAuthMethod, protocolVersion));
+            () -> new ProxyClientCnx(clientConf, service.getWorkerGroup(), clientAuthRole,
+                this::getOrRefreshClientAuthData, clientAuthMethod, protocolVersion,
+                service.getConfiguration().isForwardAuthorizationCredentials()));
         return new PulsarClientImpl(clientConf, service.getWorkerGroup(), connectionPool, service.getTimer());
+    }
+
+    private void updateClientAuthData(AuthData clientData) {
+        this.clientAuthData = clientData;
+        authFutureList.getAndSet(Collections.emptyList())
+            .forEach(future -> future.complete(clientData));
+    }
+
+    private CompletableFuture<AuthData> getOrRefreshClientAuthData() {
+        boolean forwardAuth = service.getConfiguration().isForwardAuthorizationCredentials();
+
+        if (!forwardAuth || authState == null || !authState.isExpired()) {
+            return CompletableFuture.completedFuture(clientAuthData);
+        }
+
+        CompletableFuture<AuthData> result = new CompletableFuture<>();
+        List<CompletableFuture<AuthData>> currentFutureList;
+        List<CompletableFuture<AuthData>> newFutureList;
+        do {
+            currentFutureList = authFutureList.get();
+            newFutureList = new LinkedList<>(currentFutureList);
+            newFutureList.add(result);
+        } while (!authFutureList.compareAndSet(currentFutureList, newFutureList));
+
+        // only first send request
+        if (!currentFutureList.isEmpty()) {
+            return result;
+        }
+
+        try {
+            AuthData authData = authState.refreshAuthentication();
+
+            ctx.writeAndFlush(Commands.newAuthChallenge(authMethod, authData, protocolVersionToAdvertise))
+                .addListener(writeFuture -> {
+                    if (writeFuture.isSuccess()) {
+                        LOG.debug("[{}] Sent auth challenge to client to refresh credentials with method: {}.",
+                            remoteAddress, authMethod);
+                    } else {
+                        LOG.warn("{} Failed to send request for mutual auth to client: {}", ctx.channel(),
+                            writeFuture.cause().getMessage());
+
+                        authFutureList.getAndSet(Collections.emptyList()).forEach(future -> {
+                            future.completeExceptionally(writeFuture.cause());
+                        });
+                    }
+                });
+        } catch (Exception e) {
+            LOG.warn("{} Failed to send request for mutual auth to client: {}", ctx.channel(), e);
+            authFutureList.getAndSet(Collections.emptyList()).forEach(future -> {
+                future.completeExceptionally(e);
+            });
+        }
+        return result;
     }
 
     private static int getProtocolVersionToAdvertise(CommandConnect connect) {
